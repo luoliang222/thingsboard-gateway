@@ -119,6 +119,7 @@ public class MqttGatewayService implements GatewayService, MqttHandler, MqttClie
     private static final String JKS = "JKS";
     private static final long DEFAULT_CONNECTION_TIMEOUT = 10000;
     private static final long DEFAULT_POLLING_INTERVAL = 1000;
+    private static final long DEFAULT_REFRESH_INTERVAL = 1000;
 
     private final ConcurrentMap<String, DeviceInfo> devices = new ConcurrentHashMap<>();
     private final AtomicLong attributesCount = new AtomicLong();
@@ -180,6 +181,9 @@ public class MqttGatewayService implements GatewayService, MqttHandler, MqttClie
         }
         if (persistence.getPollingInterval() == 0) {
             persistence.setPollingInterval(DEFAULT_POLLING_INTERVAL);
+        }
+        if (persistence.getRefrashInterval() == 0) {
+            persistence.setRefrashInterval(DEFAULT_REFRESH_INTERVAL);
         }
     }
 

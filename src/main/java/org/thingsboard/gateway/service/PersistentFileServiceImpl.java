@@ -22,6 +22,7 @@ import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Service;
 import org.thingsboard.gateway.service.conf.TbPersistenceConfiguration;
+import org.thingsboard.gateway.util.SnowflakeIdWorker;
 
 import javax.annotation.PostConstruct;
 import java.io.*;
@@ -47,18 +48,24 @@ public class PersistentFileServiceImpl implements PersistentFileService {
     private String tenantName;
 
     private ConcurrentLinkedDeque<MqttPersistentMessage> sendBuffer;
-    private ConcurrentLinkedDeque<MqttPersistentMessage> resendBuffer;
+//    private ConcurrentLinkedDeque<MqttPersistentMessage> resendBuffer;
 
     private ConcurrentMap<UUID, MqttCallbackWrapper> callbacks;
     private Map<UUID, MqttDeliveryFuture> futures;
 
-    private List<File> storageFiles;
-    private List<File> resendFiles;
+//    private List<File> storageFiles;
+    private LinkedHashMap<UUID, File> resendFilesMap = new LinkedHashMap<UUID, File>();
 
-    private int storageFileCounter;
-    private int resendFileCounter;
+//    private int storageFileCounter;
+//    private int resendFileCounter;
+    private long lastRefreshMil = 0;
 
     private File storageDir;
+    private SnowflakeIdWorker snowFlake = new SnowflakeIdWorker(0, 0);
+
+    public long getLastRefreshMil(){
+        return lastRefreshMil;
+    }
 
     @PostConstruct
     public void init() {
@@ -79,8 +86,16 @@ public class PersistentFileServiceImpl implements PersistentFileService {
     }
 
     private void initFiles() {
-        storageFiles = getFiles(STORAGE_FILE_NAME_REGEX);
-        resendFiles = getFiles(RESEND_FILE_NAME_REGEX);
+//        storageFiles = getFiles(STORAGE_FILE_NAME_REGEX);
+        List<File> l = getFiles(STORAGE_FILE_NAME_REGEX);
+        for (File file : l) {
+            String fname = file.getName();
+            long id = Long.parseLong(fname.substring(fname.lastIndexOf(DASH) + 1));
+            if (id != Long.MAX_VALUE) {
+                UUID uid = new UUID(0, id);
+                resendFilesMap.put(uid, file);
+            }
+        }
     }
 
     private List<File> getFiles(String nameRegex) {
@@ -90,8 +105,8 @@ public class PersistentFileServiceImpl implements PersistentFileService {
     }
 
     private void initFileCounters() {
-        storageFileCounter = getFileCounter(storageFiles);
-        resendFileCounter = getFileCounter(resendFiles);
+//        storageFileCounter = getFileCounter(storageFiles);
+//        resendFileCounter = getFileCounter(resendFiles);
     }
 
     private int getFileCounter(List<File> files) {
@@ -113,14 +128,15 @@ public class PersistentFileServiceImpl implements PersistentFileService {
 
     private void initBuffers() {
         sendBuffer = new ConcurrentLinkedDeque<>();
-        resendBuffer = new ConcurrentLinkedDeque<>();
+//        resendBuffer = new ConcurrentLinkedDeque<>();
     }
 
     @Override
     public MqttDeliveryFuture persistMessage(String topic,  int msgId, byte[] payload, String deviceId,
                                              Consumer<Void> onSuccess,
                                              Consumer<Throwable> onFailure) throws IOException {
-        MqttPersistentMessage message = MqttPersistentMessage.builder().id(UUID.randomUUID())
+        UUID uuid = new UUID(0, snowFlake.nextId());
+        MqttPersistentMessage message = MqttPersistentMessage.builder().id( uuid )
                 .topic(topic).deviceId(deviceId).messageId(msgId).payload(payload).build();
         MqttDeliveryFuture future = new MqttDeliveryFuture();
         addMessageToBuffer(message);
@@ -131,30 +147,54 @@ public class PersistentFileServiceImpl implements PersistentFileService {
 
     @Override
     public List<MqttPersistentMessage> getPersistentMessages() throws IOException {
-        return getMqttPersistentMessages(storageFiles, sendBuffer);
+        List<MqttPersistentMessage> messages;
+        messages = new ArrayList<>(sendBuffer);
+        sendBuffer.clear();
+        return messages;
     }
 
     @Override
     public List<MqttPersistentMessage> getResendMessages() throws IOException {
-        return getMqttPersistentMessages(resendFiles, resendBuffer);
+        List<MqttPersistentMessage> messages = new ArrayList<MqttPersistentMessage>();
+        int maxReturn = 1000;
+        if (resendFilesMap.size() > 0){
+            if (sendBuffer.size() > 0){
+                // 将内存缓冲sendBuffer的数据移动到 ==> resend，以防止数据丢失
+                saveForResend(getPersistentMessages());
+            }
+
+            ListIterator<Map.Entry<UUID, File>> reverseIte = new ArrayList<Map.Entry<UUID, File>>
+                    (resendFilesMap.entrySet()).listIterator(resendFilesMap.size());
+            while (reverseIte.hasPrevious()) {
+                if (maxReturn -- < 0)
+                    break;
+                Map.Entry<UUID, File> it = reverseIte.previous();
+                File file = it.getValue();
+                // 读取列表中的所有文件 ==> messages
+                messages.addAll(readFromFile(file));
+
+                // 从resendFilesMap 中移除该记录
+                resendFilesMap.remove(it.getKey());
+            }
+        }
+        return messages;
     }
 
-    private List<MqttPersistentMessage> getMqttPersistentMessages(List<File> files, ConcurrentLinkedDeque<MqttPersistentMessage> buffer) throws IOException {
-        List<MqttPersistentMessage> messages;
-        if (files.isEmpty()) {
-            messages = new ArrayList<>(buffer);
-            buffer.clear();
-            return messages;
-        }
-        File oldestFile = files.remove(0);
-        messages = readFromFile(oldestFile);
-        oldestFile.delete();
-        return messages;
+    private File newFileById(long id){
+        String idString = Long.toString(id);    //Long.toHexString(id);
+        File newFile = new File(storageDir, STORAGE_FILE_PREFIX + idString);
+        return newFile;
     }
 
     @Override
     public void resolveFutureSuccess(UUID id) {
         callbacks.remove(id);
+
+        // 删除缓存文件、队列中的项
+        File f = newFileById(id.getLeastSignificantBits());
+        if (f != null)
+            f.delete();
+
         MqttDeliveryFuture future = futures.remove(id);
         if (future != null) {
             future.complete(Boolean.TRUE);
@@ -163,6 +203,15 @@ public class PersistentFileServiceImpl implements PersistentFileService {
 
     @Override
     public void resolveFutureFailed(UUID id, Throwable e) {
+
+        // 外部已经执行重发了！
+        // 发送失败，需要重发
+//        File f = newFileById(id.getLeastSignificantBits());
+//        if (f.exists())
+//            resendFilesMap.put(id, f);
+//        else
+//            log.error("resolveFutureFailed: file not exist of message id:" + id);
+
         MqttDeliveryFuture future = futures.remove(id);
         if (future != null) {
             future.completeExceptionally(e);
@@ -197,13 +246,17 @@ public class PersistentFileServiceImpl implements PersistentFileService {
         return Optional.ofNullable(mqttCallbackWrapper.getFailureCallback());
     }
 
+    private boolean isRefreshTimeout(){
+        return (System.currentTimeMillis() > (getLastRefreshMil() + persistence.getRefrashInterval()));
+    }
+
+    // 保存消息到存储列表
+    // resendBuffer 为 id --> File
+    // save时将消息写入文件 /storage/id
     @Override
     public void saveForResend(MqttPersistentMessage message) throws IOException {
-        if (resendBuffer.size() >= persistence.getBufferSize()) {
-            resendFileCounter = getFileCounter(resendFiles);
-            resendFiles.add(flushBufferToFile(resendBuffer, RESEND_FILE_PREFIX + resendFileCounter));
-        }
-        resendBuffer.add(message);
+        File f = flushBufferToFile(message);
+        resendFilesMap.put(message.getId(), f);
     }
 
     @Override
@@ -213,23 +266,26 @@ public class PersistentFileServiceImpl implements PersistentFileService {
        }
     }
 
+    // sendBuffer 为内存buffer
     private void addMessageToBuffer(MqttPersistentMessage message) throws IOException {
-        if (sendBuffer.size() >= persistence.getBufferSize()) {
-            storageFiles.add(flushBufferToFile(sendBuffer, STORAGE_FILE_PREFIX + storageFileCounter++));
-        }
-        sendBuffer.add(message);
+        if (resendFilesMap.size() == 0)
+            sendBuffer.add(message);
+        else
+            saveForResend(message);
     }
 
-    private File flushBufferToFile(ConcurrentLinkedDeque<MqttPersistentMessage> buffer, String fileName) throws IOException {
+    // 将消息写入文件，每个消息一个独立文件，文件名为 STORAGE_FILE_PREFIX + id
+    private File flushBufferToFile(MqttPersistentMessage message) throws IOException {
+        long id = message.getId().getLeastSignificantBits();
+        File newFile = newFileById(id);
+        if (newFile.exists())
+            return newFile;     // 文件已经存在缓存中，不需要再写
+
         ObjectOutputStream outStream = null;
+        lastRefreshMil = System.currentTimeMillis();
         try {
-            File newFile = new File(storageDir, STORAGE_FILE_PREFIX + storageFileCounter);
             outStream = new ObjectOutputStream(new FileOutputStream(newFile));
-            for (MqttPersistentMessage message : buffer) {
-                outStream.writeObject(message);
-            }
-            buffer.clear();
-            return newFile;
+            outStream.writeObject(message);
         } catch (IOException e) {
             log.error(e.getMessage(), e);
             throw e;
@@ -242,8 +298,11 @@ public class PersistentFileServiceImpl implements PersistentFileService {
                 throw e;
             }
         }
+
+        return newFile;
     }
 
+    // 从文件读取一条消息
     private List<MqttPersistentMessage> readFromFile(File file)  throws IOException {
         List<MqttPersistentMessage> messages = new ArrayList<>();
         ObjectInputStream inputStream = null;

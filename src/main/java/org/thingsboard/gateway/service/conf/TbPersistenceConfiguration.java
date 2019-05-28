@@ -29,6 +29,6 @@ public class TbPersistenceConfiguration {
     private String type;
     private String path;
     private int bufferSize;
+    private long refrashInterval;
     private long pollingInterval;
-
 }

@@ -28,9 +28,11 @@ import java.util.function.Consumer;
  * Created by Valerii Sosliuk on 1/2/2018.
  */
 public interface PersistentFileService {
-
     MqttDeliveryFuture persistMessage(String topic, int msgId, byte[] payload, String deviceId,
                                       Consumer<Void> onSuccess, Consumer<Throwable> onFailure) throws IOException;
+
+    // get the Last Refresh time
+    long getLastRefreshMil();
 
     /**
      * Returns a list of the messages that are to be sent. If storage files exist, then the messages from oldest
